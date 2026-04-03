@@ -1,0 +1,361 @@
+# ============================================================
+# Auto Deploy Workflow — nguyen-thi-thu-huong1/002bob-
+# Domain: iiit.pro
+#   admin.iiit.pro  → Laravel admin backend (PHP API + dcat-admin)
+#   iiit.pro        → Web/PC frontend
+#   m.iiit.pro      → WAP/Mobile frontend
+#
+# Required GitHub Secrets (Settings → Secrets → Actions):
+#   SSH_HOST       — Server IP or hostname (e.g. iiit.pro or 1.2.3.4)
+#   SSH_USER       — SSH username on the server (e.g. root)
+#   SSH_KEY        — Private SSH key (PEM format, starts with -----BEGIN)
+#   SSH_PORT       — SSH port (default: 22)
+#   DB_NAME        — MySQL database name (e.g. bob002)
+#   DB_USER        — MySQL database username (e.g. bob002)
+#   DB_PASSWORD    — MySQL database password
+# ============================================================
+
+name: 🚀 Auto Deploy to iiit.pro
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+    inputs:
+      force_import_sql:
+        description: 'Force re-import SQL dump (overwrites existing data)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+jobs:
+  deploy:
+    name: Deploy to iiit.pro
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: 🔑 Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_BRANCH: ${{ github.ref_name }}
+          DB_NAME: ${{ secrets.DB_NAME }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          FORCE_SQL: ${{ github.event.inputs.force_import_sql || 'false' }}
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          envs: GH_REPO,GH_BRANCH,DB_NAME,DB_USER,DB_PASSWORD,FORCE_SQL
+          command_timeout: 40m
+          script: |
+            set -e
+
+            # ─────────────────────────────────────────────────────
+            # VARIABLES
+            # ─────────────────────────────────────────────────────
+            DEPLOY_PATH="/var/www/iiit.pro"
+            ADMIN_DOMAIN="admin.iiit.pro"
+            WEB_DOMAIN="iiit.pro"
+            WAP_DOMAIN="m.iiit.pro"
+            ADMIN_URL="http://${ADMIN_DOMAIN}"
+            DB_NAME="${DB_NAME:-bob002}"
+            DB_USER="${DB_USER:-bob002}"
+            DB_PASS="${DB_PASSWORD}"
+            GH_BRANCH="${GH_BRANCH:-main}"
+
+            echo "========================================"
+            echo " 🚀 Deploy started — $(date)"
+            echo " Repo   : ${GH_REPO}"
+            echo " Branch : ${GH_BRANCH}"
+            echo " Target : ${DEPLOY_PATH}"
+            echo "========================================"
+
+            # ─────────────────────────────────────────────────────
+            # STEP 1: INSTALL SYSTEM PACKAGES
+            # ─────────────────────────────────────────────────────
+            echo ""
+            echo "📦 [1/8] Installing system packages..."
+
+            export DEBIAN_FRONTEND=noninteractive
+
+            # Add PHP 7.4 PPA if needed
+            if ! php7.4 --version &>/dev/null 2>&1; then
+              sudo apt-get install -y software-properties-common -qq
+              sudo add-apt-repository ppa:ondrej/php -y
+            fi
+
+            sudo apt-get update -qq
+            sudo apt-get install -y \
+              git curl unzip \
+              apache2 \
+              php7.4 php7.4-cli php7.4-mysql php7.4-mbstring \
+              php7.4-xml php7.4-zip php7.4-fileinfo php7.4-gd \
+              php7.4-curl php7.4-bcmath php7.4-tokenizer \
+              php7.4-common php7.4-json libapache2-mod-php7.4 \
+              mysql-server nodejs npm -qq
+
+            # Install Composer globally if missing
+            if ! command -v composer &>/dev/null; then
+              echo "Installing Composer..."
+              curl -sS https://getcomposer.org/installer -o /tmp/composer-setup.php
+              sudo php /tmp/composer-setup.php --install-dir=/usr/local/bin --filename=composer
+            fi
+
+            # Enable required Apache modules
+            sudo a2enmod rewrite headers php7.4
+            sudo a2dismod php8.* 2>/dev/null || true
+
+            echo "✅ System packages ready."
+
+            # ─────────────────────────────────────────────────────
+            # STEP 2: CLONE / UPDATE REPOSITORY
+            # ─────────────────────────────────────────────────────
+            echo ""
+            echo "📥 [2/8] Deploying source code..."
+
+            sudo mkdir -p "${DEPLOY_PATH}"
+            sudo chown -R "${USER}:${USER}" "${DEPLOY_PATH}"
+
+            if [ -d "${DEPLOY_PATH}/.git" ]; then
+              cd "${DEPLOY_PATH}"
+              git fetch --all --prune
+              git checkout "${GH_BRANCH}" 2>/dev/null || git checkout -b "${GH_BRANCH}" "origin/${GH_BRANCH}"
+              git reset --hard "origin/${GH_BRANCH}"
+            else
+              git clone --branch "${GH_BRANCH}" \
+                "https://github.com/${GH_REPO}.git" "${DEPLOY_PATH}"
+              cd "${DEPLOY_PATH}"
+            fi
+
+            echo "✅ Source code deployed."
+
+            # ─────────────────────────────────────────────────────
+            # STEP 3: CONFIGURE LARAVEL .env (DEBUG/DEV MODE)
+            # ─────────────────────────────────────────────────────
+            echo ""
+            echo "⚙️  [3/8] Configuring Laravel environment (debug=true)..."
+
+            cd "${DEPLOY_PATH}/admin"
+
+            # Create .env from example if it doesn't exist
+            [ -f .env ] || cp .env.example .env
+
+            # Set all required values
+            sed -i "s|^APP_ENV=.*|APP_ENV=local|"           .env
+            sed -i "s|^APP_DEBUG=.*|APP_DEBUG=true|"         .env
+            sed -i "s|^APP_URL=.*|APP_URL=${ADMIN_URL}|"     .env
+            sed -i "s|^DB_DATABASE=.*|DB_DATABASE=${DB_NAME}|" .env
+            sed -i "s|^DB_USERNAME=.*|DB_USERNAME=${DB_USER}|" .env
+            sed -i "s|^DB_PASSWORD=.*|DB_PASSWORD=${DB_PASS}|" .env
+            sed -i "s|^DB_HOST=.*|DB_HOST=127.0.0.1|"        .env
+
+            echo "✅ .env configured."
+
+            # ─────────────────────────────────────────────────────
+            # STEP 4: INSTALL PHP & NODE DEPENDENCIES
+            # ─────────────────────────────────────────────────────
+            echo ""
+            echo "📦 [4/8] Installing PHP and Node.js dependencies..."
+
+            cd "${DEPLOY_PATH}/admin"
+
+            # Install all Composer packages (including require-dev for debug tools)
+            composer install --no-interaction --prefer-dist
+
+            # Generate application key if not already set
+            grep -q "APP_KEY=base64:" .env || php artisan key:generate --force
+
+            # Install all Node.js devDependencies and compile assets
+            npm install
+            npm run dev || npm run production
+
+            echo "✅ Dependencies installed."
+
+            # ─────────────────────────────────────────────────────
+            # STEP 5: SET UP MYSQL DATABASE
+            # ─────────────────────────────────────────────────────
+            echo ""
+            echo "🗄️  [5/8] Setting up MySQL database..."
+
+            # Create database and user
+            sudo mysql -u root -e "
+              CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\`
+                CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+              CREATE USER IF NOT EXISTS '${DB_USER}'@'localhost'
+                IDENTIFIED BY '${DB_PASS}';
+              GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'localhost';
+              FLUSH PRIVILEGES;
+            "
+
+            # Determine SQL dump file (handle non-ASCII filename)
+            SQL_FILE=$(find "${DEPLOY_PATH}" -maxdepth 1 -name "*.sql" | head -1)
+
+            TABLE_COUNT=$(sudo mysql -u root "${DB_NAME}" \
+              -e "SHOW TABLES;" 2>/dev/null | wc -l)
+
+            if [ "${FORCE_SQL}" = "true" ] || [ "${TABLE_COUNT}" -lt 5 ]; then
+              if [ -n "${SQL_FILE}" ]; then
+                echo "Importing SQL dump: ${SQL_FILE}"
+                sudo mysql -u root "${DB_NAME}" < "${SQL_FILE}"
+              fi
+            fi
+
+            # Run any pending migrations
+            cd "${DEPLOY_PATH}/admin"
+            php artisan migrate --force
+
+            echo "✅ Database ready."
+
+            # ─────────────────────────────────────────────────────
+            # STEP 6: CREATE USER alisababi / 123456
+            # ─────────────────────────────────────────────────────
+            echo ""
+            echo "👤 [6/8] Creating user account alisababi..."
+
+            cd "${DEPLOY_PATH}/admin"
+
+            # Generate bcrypt hash of "123456" using PHP
+            PHP_HASH=$(php -r "echo password_hash('123456', PASSWORD_BCRYPT);")
+            API_TOKEN=$(php -r "echo bin2hex(random_bytes(30));")
+
+            sudo mysql -u root "${DB_NAME}" -e "
+              INSERT INTO users
+                (username, password, realname, api_token,
+                 status, isdel, isblack,
+                 balance, mbalance, paysum,
+                 vip, level, exp, fid,
+                 isonline, allowagent, loginsum,
+                 created_at, updated_at)
+              VALUES
+                ('alisababi', '${PHP_HASH}', 'alisababi', '${API_TOKEN}',
+                 1, 0, 0,
+                 0.00, 0.00, 0.00,
+                 0, 0, 0, 0,
+                 0, 0, 0,
+                 NOW(), NOW())
+              ON DUPLICATE KEY UPDATE updated_at=updated_at;
+            " 2>/dev/null || echo "⚠️  User insert skipped (may already exist)."
+
+            echo "✅ User alisababi created (password: 123456)."
+
+            # ─────────────────────────────────────────────────────
+            # STEP 7: UPDATE FRONTEND API URLs & PERMISSIONS
+            # ─────────────────────────────────────────────────────
+            echo ""
+            echo "🔧 [7/8] Updating frontend API URLs..."
+
+            # Replace hardcoded dev API IP in wap JS bundle
+            find "${DEPLOY_PATH}/wap/static/js" -name "*.js" \
+              -exec sed -i "s|http://127\.0\.2\.6|${ADMIN_URL}|g" {} \;
+
+            # Replace hardcoded dev API IP in web JS bundle
+            find "${DEPLOY_PATH}/web/static/js" -name "*.js" \
+              -exec sed -i "s|http://127\.0\.2\.6|${ADMIN_URL}|g" {} \;
+
+            # Publish dcat-admin assets and clear Laravel caches
+            cd "${DEPLOY_PATH}/admin"
+            php artisan vendor:publish --tag=dcat-admin-assets --force --quiet
+            php artisan config:clear
+            php artisan cache:clear
+            php artisan view:clear
+            php artisan route:clear
+
+            # Set correct ownership and permissions
+            sudo chown -R www-data:www-data "${DEPLOY_PATH}"
+            sudo find "${DEPLOY_PATH}/admin" -type f -exec chmod 644 {} \;
+            sudo find "${DEPLOY_PATH}/admin" -type d -exec chmod 755 {} \;
+            sudo chmod -R 775 "${DEPLOY_PATH}/admin/storage"
+            sudo chmod -R 775 "${DEPLOY_PATH}/admin/bootstrap/cache"
+            sudo chmod -R 755 "${DEPLOY_PATH}/web"
+            sudo chmod -R 755 "${DEPLOY_PATH}/wap"
+
+            echo "✅ Frontend URLs updated and permissions set."
+
+            # ─────────────────────────────────────────────────────
+            # STEP 8: CONFIGURE APACHE VIRTUAL HOSTS
+            # ─────────────────────────────────────────────────────
+            echo ""
+            echo "🌐 [8/8] Configuring Apache virtual hosts..."
+
+            sudo tee /etc/apache2/sites-available/iiit.pro.conf > /dev/null <<'VHOST_EOF'
+            # admin.iiit.pro — Laravel backend + dcat-admin panel
+            <VirtualHost *:80>
+                ServerName admin.iiit.pro
+                DocumentRoot /var/www/iiit.pro/admin/public
+
+                <Directory /var/www/iiit.pro/admin/public>
+                    AllowOverride All
+                    Require all granted
+                    Options +FollowSymLinks -Indexes
+                </Directory>
+
+                <FilesMatch \.php$>
+                    SetHandler application/x-httpd-php
+                </FilesMatch>
+
+                ErrorLog  ${APACHE_LOG_DIR}/admin-error.log
+                CustomLog ${APACHE_LOG_DIR}/admin-access.log combined
+            </VirtualHost>
+
+            # iiit.pro / www.iiit.pro — PC web frontend
+            <VirtualHost *:80>
+                ServerName  iiit.pro
+                ServerAlias www.iiit.pro
+                DocumentRoot /var/www/iiit.pro/web
+
+                <Directory /var/www/iiit.pro/web>
+                    AllowOverride All
+                    Require all granted
+                    Options +FollowSymLinks -Indexes
+                </Directory>
+
+                ErrorLog  ${APACHE_LOG_DIR}/web-error.log
+                CustomLog ${APACHE_LOG_DIR}/web-access.log combined
+            </VirtualHost>
+
+            # m.iiit.pro — WAP / mobile frontend
+            <VirtualHost *:80>
+                ServerName m.iiit.pro
+                DocumentRoot /var/www/iiit.pro/wap
+
+                <Directory /var/www/iiit.pro/wap>
+                    AllowOverride All
+                    Require all granted
+                    Options +FollowSymLinks -Indexes
+                </Directory>
+
+                ErrorLog  ${APACHE_LOG_DIR}/wap-error.log
+                CustomLog ${APACHE_LOG_DIR}/wap-access.log combined
+            </VirtualHost>
+            VHOST_EOF
+
+            sudo a2ensite iiit.pro.conf
+            sudo a2dissite 000-default.conf 2>/dev/null || true
+            sudo apache2ctl configtest
+            sudo systemctl restart apache2
+
+            # ─────────────────────────────────────────────────────
+            # DONE
+            # ─────────────────────────────────────────────────────
+            echo ""
+            echo "========================================"
+            echo " ✅ Deployment completed — $(date)"
+            echo "========================================"
+            echo ""
+            echo " 🔑 Admin panel  : http://admin.iiit.pro/admin"
+            echo "    Default login: admin / admin"
+            echo ""
+            echo " 💻 PC frontend  : http://iiit.pro"
+            echo " 📱 WAP frontend : http://m.iiit.pro"
+            echo ""
+            echo " 👤 Member login : alisababi / 123456"
+            echo "========================================"
