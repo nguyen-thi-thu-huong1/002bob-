@@ -6,13 +6,14 @@
 #   m.iiit.pro      → WAP/Mobile frontend
 #
 # Required GitHub Secrets (Settings → Secrets → Actions):
-#   SSH_HOST       — Server IP or hostname (e.g. iiit.pro or 1.2.3.4)
-#   SSH_USER       — SSH username on the server (e.g. root)
-#   SSH_KEY        — Private SSH key (PEM format, starts with -----BEGIN)
-#   SSH_PORT       — SSH port (default: 22)
-#   DB_NAME        — MySQL database name (e.g. bob002)
-#   DB_USER        — MySQL database username (e.g. bob002)
-#   DB_PASSWORD    — MySQL database password
+#   SSH_HOST        — Server IP or hostname (e.g. iiit.pro or 1.2.3.4)
+#   SSH_USER        — SSH username on the server (e.g. root)
+#   SSH_KEY         — Private SSH key (PEM format, starts with -----BEGIN)
+#   SSH_PORT        — SSH port (default: 22)
+#   DB_NAME         — MySQL database name (e.g. bob002)
+#   DB_USER         — MySQL database username (e.g. bob002)
+#   DB_PASSWORD     — MySQL database password
+#   USER_PASSWORD   — Password for member account alisababi (default: 123456)
 # ============================================================
 
 name: 🚀 Auto Deploy to iiit.pro
@@ -38,6 +39,9 @@ jobs:
     name: Deploy to iiit.pro
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # Restrict GITHUB_TOKEN to read-only; SSH credentials come from secrets
+    permissions:
+      contents: read
 
     steps:
       - name: 🔑 Deploy via SSH
@@ -48,13 +52,14 @@ jobs:
           DB_NAME: ${{ secrets.DB_NAME }}
           DB_USER: ${{ secrets.DB_USER }}
           DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          USER_PASSWORD: ${{ secrets.USER_PASSWORD || '123456' }}
           FORCE_SQL: ${{ github.event.inputs.force_import_sql || 'false' }}
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_KEY }}
           port: ${{ secrets.SSH_PORT || 22 }}
-          envs: GH_REPO,GH_BRANCH,DB_NAME,DB_USER,DB_PASSWORD,FORCE_SQL
+          envs: GH_REPO,GH_BRANCH,DB_NAME,DB_USER,DB_PASSWORD,USER_PASSWORD,FORCE_SQL
           command_timeout: 40m
           script: |
             set -e
@@ -88,7 +93,7 @@ jobs:
             export DEBIAN_FRONTEND=noninteractive
 
             # Add PHP 7.4 PPA if needed
-            if ! php7.4 --version &>/dev/null 2>&1; then
+            if ! command -v php7.4 &>/dev/null; then
               sudo apt-get install -y software-properties-common -qq
               sudo add-apt-repository ppa:ondrej/php -y
             fi
@@ -223,8 +228,9 @@ jobs:
 
             cd "${DEPLOY_PATH}/admin"
 
-            # Generate bcrypt hash of "123456" using PHP
-            PHP_HASH=$(php -r "echo password_hash('123456', PASSWORD_BCRYPT);")
+            # Generate bcrypt hash of user password using PHP
+            PHP_HASH=$(php -r "echo password_hash('${USER_PASSWORD}', PASSWORD_BCRYPT);")
+            # Only generate a new API token for new inserts; do not overwrite on updates
             API_TOKEN=$(php -r "echo bin2hex(random_bytes(30));")
 
             sudo mysql -u root "${DB_NAME}" -e "
@@ -242,10 +248,12 @@ jobs:
                  0, 0, 0, 0,
                  0, 0, 0,
                  NOW(), NOW())
-              ON DUPLICATE KEY UPDATE updated_at=updated_at;
+              ON DUPLICATE KEY UPDATE
+                password=VALUES(password),
+                updated_at=NOW();
             " 2>/dev/null || echo "⚠️  User insert skipped (may already exist)."
 
-            echo "✅ User alisababi created (password: 123456)."
+            echo "✅ User alisababi created (password set via USER_PASSWORD secret)."
 
             # ─────────────────────────────────────────────────────
             # STEP 7: UPDATE FRONTEND API URLs & PERMISSIONS
@@ -253,13 +261,12 @@ jobs:
             echo ""
             echo "🔧 [7/8] Updating frontend API URLs..."
 
-            # Replace hardcoded dev API IP in wap JS bundle
-            find "${DEPLOY_PATH}/wap/static/js" -name "*.js" \
-              -exec sed -i "s|http://127\.0\.2\.6|${ADMIN_URL}|g" {} \;
-
-            # Replace hardcoded dev API IP in web JS bundle
-            find "${DEPLOY_PATH}/web/static/js" -name "*.js" \
-              -exec sed -i "s|http://127\.0\.2\.6|${ADMIN_URL}|g" {} \;
+            # Replace hardcoded dev API IP in wap and web JS bundles
+            for FRONTEND_DIR in "${DEPLOY_PATH}/wap/static/js" "${DEPLOY_PATH}/web/static/js"; do
+              [ -d "${FRONTEND_DIR}" ] && \
+                find "${FRONTEND_DIR}" -name "*.js" \
+                  -exec sed -i "s|http://127\.0\.2\.6|${ADMIN_URL}|g" {} \;
+            done
 
             # Publish dcat-admin assets and clear Laravel caches
             cd "${DEPLOY_PATH}/admin"
@@ -357,5 +364,5 @@ jobs:
             echo " 💻 PC frontend  : http://iiit.pro"
             echo " 📱 WAP frontend : http://m.iiit.pro"
             echo ""
-            echo " 👤 Member login : alisababi / 123456"
+            echo " 👤 Member login : alisababi / <USER_PASSWORD secret>"
             echo "========================================"
